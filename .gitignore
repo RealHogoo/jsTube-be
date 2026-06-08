@@ -1,0 +1,11 @@
+﻿.env
+*.pyc
+__pycache__/
+.venv/
+.runtime/
+*.sqlite3
+media-service.sqlite3
+logs/
+*.log
+.pytest_cache/
+.mypy_cache/
