@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 import requests
 from bson import ObjectId
@@ -91,14 +91,50 @@ def me(request: HttpRequest) -> JsonResponse:
     })
 
 
+@csrf_exempt
+def logout(request: HttpRequest) -> JsonResponse | HttpResponse:
+    if request.method == "OPTIONS":
+        return HttpResponse(status=204)
+    if request.method != "POST":
+        return bad_request("POST is required")
+
+    token = auth_token(request)
+    if token:
+        try:
+            requests.post(
+                f"{settings.MEDIA_CONFIG['ADMIN_SERVICE_BASE_URL']}/logout.json",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={},
+                timeout=3,
+            )
+        except requests.RequestException:
+            LOGGER.info("admin logout request failed", exc_info=True)
+
+    response = ok({"logout": True})
+    clear_cookie(response, "ACCESS_TOKEN")
+    clear_cookie(response, "REFRESH_TOKEN")
+    clear_cookie(response, "LOGIN_SESSION_ID")
+    return response
+
+
+def clear_cookie(response: HttpResponse, name: str) -> None:
+    response.delete_cookie(name, path="/", samesite="Strict")
+
+
 def sync(request: HttpRequest) -> JsonResponse:
     user = require_user(request)
     if not isinstance(user, CurrentUser):
         return user
     if not user.is_admin:
         return JsonResponse({"ok": False, "code": "FORBIDDEN", "message": "admin permission is required"}, status=403)
+    if not user.has_permission("WRITE"):
+        return JsonResponse({"ok": False, "code": "FORBIDDEN", "message": "write permission is required"}, status=403)
     limit = int_param(request, "limit", 0)
-    return ok(sync_from_webhard(user, limit if limit > 0 else None))
+    try:
+        return ok(sync_from_webhard(user, limit if limit > 0 else None))
+    except RuntimeError as exc:
+        LOGGER.warning("webhard sync failed: %s", exc)
+        return JsonResponse({"ok": False, "code": "WEBHARD_SYNC_FAILED", "message": str(exc)}, status=502)
 
 
 @csrf_exempt
@@ -165,7 +201,7 @@ def youtube_import_status(request: HttpRequest) -> JsonResponse | HttpResponse:
         }
         if not user.is_admin:
             query["owner_user_id"] = user.user_id
-        items = [serialize_media(item) for item in media_collection().find(query, media_list_projection()).limit(200)]
+        items = [serialize_media(item, user=user) for item in media_collection().find(query, media_list_projection()).limit(200)]
     return ok({"items": items, "saved_count": len(items), "job": youtube_import_job(job_id, user)})
 
 
@@ -320,7 +356,10 @@ def media_list(request: HttpRequest) -> JsonResponse:
     cursor = collection.find(query, media_list_projection()).sort(sort).skip(offset).limit(limit + 1)
     raw_items = list(cursor)
     state_map = user_state_map(user, [int(item.get("webhard_file_id") or 0) for item in raw_items])
-    fetched_items = [serialize_media(item, user_state=state_map.get(int(item.get("webhard_file_id") or 0))) for item in raw_items]
+    fetched_items = [
+        serialize_media(item, user=user, user_state=state_map.get(int(item.get("webhard_file_id") or 0)))
+        for item in raw_items
+    ]
     has_more = len(fetched_items) > limit
     items = fetched_items[:limit]
     return ok({
@@ -349,13 +388,15 @@ def media_detail(request: HttpRequest, webhard_file_id: int) -> JsonResponse | H
         item = media_collection().find_one(query)
         if not item:
             return JsonResponse({"ok": False, "code": "NOT_FOUND", "message": "media not found"}, status=404)
-        return ok({"item": serialize_media(item, user_state=user_state(user, webhard_file_id))})
+        return ok({"item": serialize_media(item, user=user, user_state=user_state(user, webhard_file_id))})
 
     body = json_body(request)
     item = media_collection().find_one(query)
     if not item:
         return JsonResponse({"ok": False, "code": "NOT_FOUND", "message": "media not found"}, status=404)
     edit_fields = {"tags", "album", "title", "description", "channel_name", "subscribed"}
+    if edit_fields.intersection(body.keys()) and not user.has_permission("WRITE"):
+        return JsonResponse({"ok": False, "code": "FORBIDDEN", "message": "write permission is required"}, status=403)
     if edit_fields.intersection(body.keys()) and not can_manage_media(user, item):
         return JsonResponse({"ok": False, "code": "FORBIDDEN", "message": "owner or admin permission is required"}, status=403)
 
@@ -396,7 +437,7 @@ def media_detail(request: HttpRequest, webhard_file_id: int) -> JsonResponse | H
         if result.matched_count == 0:
             return JsonResponse({"ok": False, "code": "NOT_FOUND", "message": "media not found"}, status=404)
     item = media_collection().find_one(query)
-    return ok({"item": serialize_media(item, user_state=user_state(user, webhard_file_id))})
+    return ok({"item": serialize_media(item, user=user, user_state=user_state(user, webhard_file_id))})
 
 
 @csrf_exempt
@@ -457,6 +498,8 @@ def media_thumbnail(request: HttpRequest, webhard_file_id: int) -> JsonResponse 
     user = require_user(request)
     if not isinstance(user, CurrentUser):
         return user
+    if not user.has_permission("WRITE"):
+        return JsonResponse({"ok": False, "code": "FORBIDDEN", "message": "write permission is required"}, status=403)
     item = media_collection().find_one({"webhard_file_id": webhard_file_id})
     if not item:
         return JsonResponse({"ok": False, "code": "NOT_FOUND", "message": "media not found"}, status=404)
@@ -497,7 +540,7 @@ def media_thumbnail(request: HttpRequest, webhard_file_id: int) -> JsonResponse 
         )
 
     synced = sync_one_from_webhard(user, webhard_file_id)
-    return ok({"thumbnail": body.get("data") or {}, "item": serialize_media(synced.get("item"))})
+    return ok({"thumbnail": body.get("data") or {}, "item": serialize_media(synced.get("item"), user=user)})
 
 
 @csrf_exempt
@@ -666,7 +709,11 @@ def albums(request: HttpRequest) -> JsonResponse:
     return ok({"items": values})
 
 
-def serialize_media(item: dict[str, Any] | None, user_state: dict[str, Any] | None = None) -> dict[str, Any]:
+def serialize_media(
+    item: dict[str, Any] | None,
+    user: CurrentUser | None = None,
+    user_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if not item:
         return {}
     result = dict(item)
@@ -687,6 +734,7 @@ def serialize_media(item: dict[str, Any] | None, user_state: dict[str, Any] | No
     content_url = str(result.get("content_url") or "")
     if result.get("content_kind") == "VIDEO" and (thumbnail_url == content_url or "/file/content/" in thumbnail_url):
         result["thumbnail_url"] = ""
+    append_file_access_tokens(result, user.access_token if user else "")
     for key, value in list(result.items()):
         if isinstance(value, ObjectId):
             result[key] = str(value)
@@ -1265,6 +1313,22 @@ def karaoke_search_terms(keyword: str) -> list[str]:
     return result
 
 
+def append_file_access_tokens(result: dict[str, Any], access_token: str) -> None:
+    if not access_token:
+        return
+    for key in ("thumbnail_url", "content_url", "download_url"):
+        result[key] = file_url_with_access_token(str(result.get(key) or ""), access_token)
+
+
+def file_url_with_access_token(url: str, access_token: str) -> str:
+    if not url or "-file/" not in url:
+        return url
+    parsed = urlsplit(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["access_token"] = access_token
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+
+
 def is_remote_rate_limited(session: dict[str, Any]) -> bool:
     now = datetime.utcnow()
     recent_count = 0
@@ -1285,7 +1349,7 @@ def sanitize_remote_payload(user: CurrentUser, payload: dict[str, Any]) -> dict[
             webhard_file_id = 0
         media_item = media_collection().find_one(readable_media_query(user, webhard_file_id)) if webhard_file_id else None
         if media_item:
-            result["item"] = serialize_media(media_item)
+            result["item"] = serialize_media(media_item, user=user)
     return result
 
 

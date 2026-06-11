@@ -40,7 +40,7 @@ def require_user(request: HttpRequest, permission: str | None = None) -> Current
     token, source = auth_token_with_source(request)
     if not token:
         return JsonResponse({"ok": False, "code": "UNAUTHORIZED", "message": "login is required"}, status=401)
-    if source == "cookie" and is_cross_site_request(request):
+    if source == "cookie" and is_cross_site_request(request) and not is_trusted_cors_request(request):
         return JsonResponse({"ok": False, "code": "FORBIDDEN", "message": "authentication cookie cannot be used for cross-site requests"}, status=403)
 
     current_user = fetch_current_user(token)
@@ -66,7 +66,13 @@ def auth_token_with_source(request: HttpRequest) -> tuple[str, str]:
     if authorization.startswith("Bearer "):
         return authorization[len("Bearer ") :].strip(), "bearer"
     cookie = request.COOKIES.get("ACCESS_TOKEN", "").strip()
-    return cookie, "cookie" if cookie else ""
+    if cookie:
+        return cookie, "cookie"
+    if request.method.upper() == "GET" and request.path.endswith("-file/"):
+        query_token = request.GET.get("access_token", "").strip()
+        if query_token:
+            return query_token, "query"
+    return "", ""
 
 
 def is_cross_site_request(request: HttpRequest) -> bool:
@@ -80,6 +86,13 @@ def is_cross_site_request(request: HttpRequest) -> bool:
     if request.method.upper() in {"POST", "PATCH", "DELETE"} and not origin and not referer:
         return True
     return not is_same_origin(request, origin) or not is_same_origin(request, referer)
+
+
+def is_trusted_cors_request(request: HttpRequest) -> bool:
+    origin = request.headers.get("Origin", "").strip()
+    if not origin:
+        return False
+    return origin in getattr(settings, "CORS_ORIGINS", [])
 
 
 def is_same_origin(request: HttpRequest, source: str) -> bool:

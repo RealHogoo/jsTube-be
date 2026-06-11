@@ -65,4 +65,9 @@ MEDIA_CONFIG = {
     "YOUTUBE_IMPORT_MAX_ITEMS": int(os.environ.get("YOUTUBE_IMPORT_MAX_ITEMS", "100")),
 }
 
-CORS_ORIGINS = [item.strip() for item in os.environ.get("MEDIA_SERVICE_CORS_ORIGINS", "").split(",") if item.strip()]
+DEFAULT_CORS_ORIGINS = "http://localhost:8084,http://localhost:8085,http://127.0.0.1:8084,http://127.0.0.1:8085"
+CORS_ORIGINS = [
+    item.strip()
+    for item in os.environ.get("MEDIA_SERVICE_CORS_ORIGINS", DEFAULT_CORS_ORIGINS).split(",")
+    if item.strip()
+]

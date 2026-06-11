@@ -7,6 +7,7 @@ urlpatterns = [
     path("health/", views.health),
     path("version/", views.version),
     path("me/", views.me),
+    path("logout/", views.logout),
     path("sync/", lambda request: views.options_or_view(request, views.sync)),
     path("youtube/tools/check/", views.youtube_tools_check),
     path("youtube/preview/", views.youtube_preview),
