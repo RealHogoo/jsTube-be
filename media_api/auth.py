@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from hashlib import sha256
 from time import monotonic
 from typing import Any
 from urllib.parse import urlparse
@@ -10,6 +11,7 @@ from django.http import HttpRequest, JsonResponse
 
 MEDIA_SERVICE = "MEDIA_SERVICE"
 _user_cache: dict[str, tuple[float, "CurrentUser"]] = {}
+_service_status_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
 
 @dataclass(frozen=True)
@@ -68,10 +70,6 @@ def auth_token_with_source(request: HttpRequest) -> tuple[str, str]:
     cookie = request.COOKIES.get("ACCESS_TOKEN", "").strip()
     if cookie:
         return cookie, "cookie"
-    if request.method.upper() == "GET" and request.path.endswith("-file/"):
-        query_token = request.GET.get("access_token", "").strip()
-        if query_token:
-            return query_token, "query"
     return "", ""
 
 
@@ -157,6 +155,10 @@ def fetch_current_user(token: str) -> CurrentUser | None:
 
 
 def fetch_service_status(token: str, service_code: str) -> dict[str, Any] | None:
+    cache_key = f"{token_cache_key(token)}:{normalize_code(service_code)}"
+    cached = cached_service_status(cache_key)
+    if cached is not _CACHE_MISS:
+        return cached
     url = f"{settings.MEDIA_CONFIG['ADMIN_SERVICE_BASE_URL']}/health/service/list.json"
     try:
         response = requests.post(
@@ -176,20 +178,52 @@ def fetch_service_status(token: str, service_code: str) -> dict[str, Any] | None
     normalized = normalize_code(service_code)
     for item in items:
         if isinstance(item, dict) and normalize_code(str(item.get("service_cd") or "")) == normalized:
+            cache_service_status(cache_key, item)
             return item
+    cache_service_status(cache_key, None)
     return None
+
+
+_CACHE_MISS = object()
+
+
+def cached_service_status(cache_key: str) -> dict[str, Any] | None | object:
+    ttl = service_status_cache_ttl()
+    if ttl <= 0:
+        return _CACHE_MISS
+    cached = _service_status_cache.get(cache_key)
+    if not cached:
+        return _CACHE_MISS
+    expires_at, service_status = cached
+    if expires_at <= monotonic():
+        _service_status_cache.pop(cache_key, None)
+        return _CACHE_MISS
+    return service_status
+
+
+def cache_service_status(cache_key: str, service_status: dict[str, Any] | None) -> None:
+    ttl = service_status_cache_ttl()
+    if ttl <= 0:
+        return
+    if len(_service_status_cache) > 1000:
+        now = monotonic()
+        expired = [key for key, (expires_at, _) in _service_status_cache.items() if expires_at <= now]
+        for key in expired:
+            _service_status_cache.pop(key, None)
+    _service_status_cache[cache_key] = (monotonic() + ttl, service_status)
 
 
 def cached_current_user(token: str) -> CurrentUser | None:
     ttl = auth_cache_ttl()
     if ttl <= 0:
         return None
-    cached = _user_cache.get(token)
+    cache_key = token_cache_key(token)
+    cached = _user_cache.get(cache_key)
     if not cached:
         return None
     expires_at, current_user = cached
     if expires_at <= monotonic():
-        _user_cache.pop(token, None)
+        _user_cache.pop(cache_key, None)
         return None
     return current_user
 
@@ -203,7 +237,11 @@ def cache_current_user(token: str, current_user: CurrentUser) -> None:
         expired = [key for key, (expires_at, _) in _user_cache.items() if expires_at <= now]
         for key in expired:
             _user_cache.pop(key, None)
-    _user_cache[token] = (monotonic() + ttl, current_user)
+    _user_cache[token_cache_key(token)] = (monotonic() + ttl, current_user)
+
+
+def token_cache_key(token: str) -> str:
+    return sha256(str(token or "").encode("utf-8")).hexdigest()
 
 
 def auth_cache_ttl() -> float:
@@ -211,6 +249,13 @@ def auth_cache_ttl() -> float:
         return max(float(settings.MEDIA_CONFIG.get("AUTH_CACHE_SECONDS") or 5), 0)
     except (TypeError, ValueError):
         return 5
+
+
+def service_status_cache_ttl() -> float:
+    try:
+        return max(float(settings.MEDIA_CONFIG.get("SERVICE_STATUS_CACHE_SECONDS") or auth_cache_ttl()), 0)
+    except (TypeError, ValueError):
+        return auth_cache_ttl()
 
 
 def normalize_permissions(raw: Any) -> dict[str, list[str]]:

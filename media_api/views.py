@@ -1,9 +1,13 @@
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
 import subprocess
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -23,9 +27,9 @@ from .webhard import stream_webhard_file, sync_from_webhard, sync_one_from_webha
 from .youtube import check_download_tools, import_youtube_item, preview_youtube
 
 try:
-    YOUTUBE_IMPORT_CONCURRENCY = max(int(os.getenv("YOUTUBE_IMPORT_CONCURRENCY", "1")), 1)
+    YOUTUBE_IMPORT_CONCURRENCY = max(int(os.getenv("YOUTUBE_IMPORT_CONCURRENCY", "3")), 1)
 except ValueError:
-    YOUTUBE_IMPORT_CONCURRENCY = 1
+    YOUTUBE_IMPORT_CONCURRENCY = 3
 YOUTUBE_IMPORT_SEMAPHORE = threading.Semaphore(YOUTUBE_IMPORT_CONCURRENCY)
 LOGGER = logging.getLogger(__name__)
 
@@ -309,9 +313,9 @@ def media_list(request: HttpRequest) -> JsonResponse:
     if request.GET.get("favorite") in {"true", "1", "Y"}:
         favorite_ids = favorite_media_ids(user)
         query["webhard_file_id"] = {"$in": favorite_ids}
-    if request.GET.get("q"):
-        keyword = request.GET["q"].strip()[:80]
-    if request.GET.get("q") and keyword:
+    keyword = request.GET.get("q", "").strip()[:80]
+    initial_search = content_kind == "KARAOKE" and request.GET.get("search_mode") == "initial"
+    if keyword and not initial_search:
         search_terms = karaoke_search_terms(keyword) if content_kind == "KARAOKE" else [keyword]
         search_patterns = [re.escape(term) for term in search_terms]
         search_fields = [
@@ -353,17 +357,23 @@ def media_list(request: HttpRequest) -> JsonResponse:
     counts = None
     if offset == 0 or request.GET.get("include_counts") in {"true", "1", "Y"}:
         counts = media_counts(collection, count_base_query)
-    cursor = collection.find(query, media_list_projection()).sort(sort).skip(offset).limit(limit + 1)
-    raw_items = list(cursor)
-    state_map = user_state_map(user, [int(item.get("webhard_file_id") or 0) for item in raw_items])
+    if initial_search and keyword:
+        candidate_limit = max(500, offset + limit + 1)
+        candidates = list(collection.find(query, media_list_projection()).sort(sort).limit(candidate_limit))
+        raw_items = [item for item in candidates if karaoke_initial_matches(item, keyword)]
+        raw_items = raw_items[offset:offset + limit + 1]
+    else:
+        cursor = collection.find(query, media_list_projection()).sort(sort).skip(offset).limit(limit + 1)
+        raw_items = list(cursor)
+    has_more = len(raw_items) > limit
+    visible_raw_items = raw_items[:limit]
+    state_map = user_state_map(user, [int(item.get("webhard_file_id") or 0) for item in visible_raw_items])
     fetched_items = [
         serialize_media(item, user=user, user_state=state_map.get(int(item.get("webhard_file_id") or 0)))
-        for item in raw_items
+        for item in visible_raw_items
     ]
-    has_more = len(fetched_items) > limit
-    items = fetched_items[:limit]
     return ok({
-        "items": items,
+        "items": fetched_items,
         "limit": limit,
         "offset": offset,
         "has_more": has_more,
@@ -653,24 +663,42 @@ def karaoke_remote_commands(request: HttpRequest, session_id: str) -> JsonRespon
 
 
 def media_file_proxy(request: HttpRequest, webhard_file_id: int, file_kind: str) -> JsonResponse | HttpResponse:
-    user = require_user(request)
-    if not isinstance(user, CurrentUser):
-        return user
-
-    item = media_collection().find_one(readable_media_query(user, webhard_file_id))
-    if not item:
-        return JsonResponse({"ok": False, "code": "NOT_FOUND", "message": "media file not found"}, status=404)
-
     if file_kind not in {"thumbnail", "content", "download"}:
         return bad_request("invalid file kind")
+
     range_header = ""
     if file_kind == "content":
         range_header = normalized_range_header(request.headers.get("Range", ""))
         if range_header is None:
             return JsonResponse({"ok": False, "code": "INVALID_RANGE", "message": "range header is invalid"}, status=416)
+
+    user = require_user(request)
+    signed_payload = None
+    if isinstance(user, CurrentUser):
+        item = media_collection().find_one(readable_media_query(user, webhard_file_id))
+        stream_user = user
+    else:
+        signed_payload = verify_file_access_token(str(request.GET.get("file_token") or ""), webhard_file_id, file_kind)
+        if not signed_payload:
+            return user
+        item = media_collection().find_one(signed_file_media_query(signed_payload, webhard_file_id))
+        stream_user = None
+
+    if not item:
+        return JsonResponse({"ok": False, "code": "NOT_FOUND", "message": "media file not found"}, status=404)
+
+    if signed_payload:
+        local_response = local_media_file_response(item, file_kind, range_header)
+        if local_response is not None:
+            return local_response
+        return JsonResponse({"ok": False, "code": "MEDIA_FILE_UNAVAILABLE", "message": "media file is unavailable"}, status=404)
+
+    if not isinstance(stream_user, CurrentUser):
+        return user
+
     try:
         upstream = stream_webhard_file(
-            user,
+            stream_user,
             webhard_file_id,
             file_kind,
             allow_public=is_public_media(item),
@@ -734,7 +762,7 @@ def serialize_media(
     content_url = str(result.get("content_url") or "")
     if result.get("content_kind") == "VIDEO" and (thumbnail_url == content_url or "/file/content/" in thumbnail_url):
         result["thumbnail_url"] = ""
-    append_file_access_tokens(result, user.access_token if user else "")
+    append_file_access_tokens(result, user)
     for key, value in list(result.items()):
         if isinstance(value, ObjectId):
             result[key] = str(value)
@@ -756,27 +784,14 @@ def media_list_projection() -> dict[str, int]:
         "content_kind": 1,
         "thumbnail_url": 1,
         "content_url": 1,
-        "download_url": 1,
         "original_created_at": 1,
-        "uploaded_at": 1,
-        "webhard_updated_at": 1,
-        "source_type": 1,
-        "youtube_video_id": 1,
-        "youtube_url": 1,
-        "youtube_playlist_id": 1,
-        "youtube_playlist_title": 1,
         "title": 1,
-        "description": 1,
         "channel_name": 1,
         "album": 1,
         "tags": 1,
         "webhard_tags": 1,
-        "webhard_memo": 1,
-        "favorite": 1,
         "view_count": 1,
         "like_count": 1,
-        "liked": 1,
-        "subscribed": 1,
     }
 
 
@@ -1313,20 +1328,224 @@ def karaoke_search_terms(keyword: str) -> list[str]:
     return result
 
 
-def append_file_access_tokens(result: dict[str, Any], access_token: str) -> None:
-    if not access_token:
+HANGUL_INITIALS = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+
+
+def karaoke_initial_matches(item: dict[str, Any], keyword: str) -> bool:
+    target = hangul_initials(keyword)
+    if not target:
+        return False
+    fields = [
+        item.get("title"),
+        item.get("display_name"),
+        item.get("channel_name"),
+        item.get("album"),
+        karaoke_artist(item),
+    ]
+    for value in fields:
+        initials = hangul_initials(str(value or ""))
+        if target in initials:
+            return True
+    return False
+
+
+def hangul_initials(value: str) -> str:
+    result = []
+    for char in str(value or "").strip():
+        code = ord(char)
+        if 0xAC00 <= code <= 0xD7A3:
+            result.append(HANGUL_INITIALS[(code - 0xAC00) // 588])
+        elif char in HANGUL_INITIALS:
+            result.append(char)
+        elif char.isalnum():
+            result.append(char.lower())
+    return "".join(result)
+
+
+def append_file_access_tokens(result: dict[str, Any], user: CurrentUser | None) -> None:
+    if not user:
+        return
+    webhard_file_id = int(result.get("webhard_file_id") or 0)
+    if webhard_file_id <= 0:
         return
     for key in ("thumbnail_url", "content_url", "download_url"):
-        result[key] = file_url_with_access_token(str(result.get(key) or ""), access_token)
+        url = str(result.get(key) or "")
+        if not url:
+            continue
+        file_kind = key.removesuffix("_url")
+        result[key] = file_url_with_access_token(url, create_file_access_token(user, webhard_file_id, file_kind))
 
 
-def file_url_with_access_token(url: str, access_token: str) -> str:
+def file_url_with_access_token(url: str, file_token: str) -> str:
     if not url or "-file/" not in url:
         return url
     parsed = urlsplit(url)
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    query["access_token"] = access_token
+    query.pop("access_token", None)
+    query["file_token"] = file_token
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+
+
+def create_file_access_token(user: CurrentUser, webhard_file_id: int, file_kind: str) -> str:
+    payload = {
+        "wid": int(webhard_file_id),
+        "kind": file_kind,
+        "uid": user.user_id,
+        "adm": bool(user.is_admin),
+        "exp": int(time.time()) + file_token_seconds(),
+    }
+    payload_bytes = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    payload_text = base64.urlsafe_b64encode(payload_bytes).decode("ascii").rstrip("=")
+    signature = hmac.new(file_token_secret(), payload_text.encode("ascii"), hashlib.sha256).digest()
+    signature_text = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
+    return f"{payload_text}.{signature_text}"
+
+
+def verify_file_access_token(token: str, webhard_file_id: int, file_kind: str) -> dict[str, Any] | None:
+    if not token or "." not in token:
+        return None
+    payload_text, signature_text = token.split(".", 1)
+    expected = hmac.new(file_token_secret(), payload_text.encode("ascii"), hashlib.sha256).digest()
+    actual = decode_urlsafe_base64(signature_text)
+    if not actual or not hmac.compare_digest(actual, expected):
+        return None
+    try:
+        payload = json.loads(decode_urlsafe_base64(payload_text).decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if int(payload.get("wid") or 0) != int(webhard_file_id):
+        return None
+    if str(payload.get("kind") or "") != file_kind:
+        return None
+    if int(payload.get("exp") or 0) < int(time.time()):
+        return None
+    if not str(payload.get("uid") or "").strip():
+        return None
+    return payload
+
+
+def signed_file_media_query(payload: dict[str, Any], webhard_file_id: int) -> dict[str, Any]:
+    if bool(payload.get("adm")):
+        return {"webhard_file_id": int(webhard_file_id)}
+    return {
+        "webhard_file_id": int(webhard_file_id),
+        "$or": [
+            {"owner_user_id": str(payload.get("uid") or "")},
+            {"owner_is_admin": True},
+        ],
+    }
+
+
+def decode_urlsafe_base64(value: str) -> bytes:
+    try:
+        padding = "=" * (-len(value) % 4)
+        return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+    except Exception:
+        return b""
+
+
+def file_token_secret() -> bytes:
+    return str(settings.SECRET_KEY).encode("utf-8")
+
+
+def file_token_seconds() -> int:
+    try:
+        return min(max(int(settings.MEDIA_CONFIG.get("FILE_TOKEN_SECONDS") or 7200), 60), 24 * 60 * 60)
+    except (TypeError, ValueError):
+        return 7200
+
+
+def local_media_file_response(item: dict[str, Any], file_kind: str, range_header: str) -> HttpResponse | None:
+    file_path = local_media_file_path(item, file_kind)
+    if not file_path:
+        return None
+    file_size = file_path.stat().st_size
+    content_type = local_media_content_type(item, file_kind)
+    range_info = parse_response_range(range_header, file_size) if range_header else None
+    if range_header and not range_info:
+        return JsonResponse({"ok": False, "code": "INVALID_RANGE", "message": "range header is invalid"}, status=416)
+    response = StreamingHttpResponse(
+        stream_local_file(file_path, range_info["start"] if range_info else 0, range_info["end"] if range_info else file_size - 1),
+        status=206 if range_info else 200,
+        content_type=content_type,
+    )
+    response["X-Content-Type-Options"] = "nosniff"
+    response["Accept-Ranges"] = "bytes"
+    response["Content-Length"] = str((range_info["end"] - range_info["start"] + 1) if range_info else file_size)
+    if range_info:
+        response["Content-Range"] = f"bytes {range_info['start']}-{range_info['end']}/{file_size}"
+    if file_kind == "download":
+        response["Content-Disposition"] = f'attachment; filename="{safe_download_name(str(item.get("file_name") or "download"))}"'
+    else:
+        response["Content-Security-Policy"] = "default-src 'none'; media-src 'self'; img-src 'self'; style-src 'none'; script-src 'none'; sandbox"
+    return response
+
+
+def local_media_file_path(item: dict[str, Any], file_kind: str) -> Path | None:
+    raw_value = item.get("thumbnail_path") if file_kind == "thumbnail" else item.get("storage_path")
+    raw_path = str(raw_value or "")
+    if not raw_path:
+        return None
+    root = Path(str(settings.MEDIA_CONFIG.get("WEBHARD_STORAGE_ROOT") or "")).resolve()
+    owner_root = (root / safe_path_segment(str(item.get("owner_user_id") or ""))).resolve()
+    target = Path(raw_path).resolve()
+    if not target.exists() or not target.is_file():
+        return None
+    if owner_root != target and owner_root not in target.parents:
+        return None
+    return target
+
+
+def local_media_content_type(item: dict[str, Any], file_kind: str) -> str:
+    if file_kind == "thumbnail":
+        return "image/webp"
+    if file_kind == "download":
+        return "application/octet-stream"
+    return str(item.get("content_type") or "application/octet-stream")
+
+
+def parse_response_range(value: str, file_size: int) -> dict[str, int] | None:
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", str(value or "").strip())
+    if not match or file_size <= 0:
+        return None
+    start_text, end_text = match.group(1), match.group(2)
+    if not start_text and not end_text:
+        return None
+    if not start_text:
+        suffix_length = int(end_text or "0")
+        if suffix_length <= 0:
+            return None
+        start = max(file_size - suffix_length, 0)
+        end = file_size - 1
+    else:
+        start = int(start_text)
+        end = int(end_text) if end_text else file_size - 1
+    if start < 0 or end < start or start >= file_size:
+        return None
+    return {"start": start, "end": min(end, file_size - 1)}
+
+
+def stream_local_file(path: Path, start: int, end: int):
+    with path.open("rb") as handle:
+        handle.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            chunk = handle.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
+def safe_download_name(value: str) -> str:
+    return re.sub(r'[\r\n"\\]+', "_", value).strip() or "download"
+
+
+def safe_path_segment(value: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9._-]", "_", str(value or "").strip())
+    return normalized or "unknown"
 
 
 def is_remote_rate_limited(session: dict[str, Any]) -> bool:

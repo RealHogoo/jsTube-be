@@ -12,11 +12,17 @@ if not SECRET_KEY:
     if IS_PRODUCTION:
         raise RuntimeError("MEDIA_SERVICE_SECRET_KEY is required in production")
     SECRET_KEY = "dev-media-secret"
+if IS_PRODUCTION and SECRET_KEY == "dev-media-secret":
+    raise RuntimeError("MEDIA_SERVICE_SECRET_KEY must not use the development default in production")
+if IS_PRODUCTION and DEBUG:
+    raise RuntimeError("MEDIA_SERVICE_DEBUG must be false in production")
 if IS_PRODUCTION and not os.environ.get("WEBHARD_STORAGE_ROOT"):
     raise RuntimeError("WEBHARD_STORAGE_ROOT is required in production")
 if IS_PRODUCTION and not os.environ.get("MEDIA_INTERNAL_API_TOKEN"):
     raise RuntimeError("MEDIA_INTERNAL_API_TOKEN is required in production")
 ALLOWED_HOSTS = [item.strip() for item in os.environ.get("MEDIA_SERVICE_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if item.strip()]
+if IS_PRODUCTION and any(item in {"*", "0.0.0.0"} for item in ALLOWED_HOSTS):
+    raise RuntimeError("MEDIA_SERVICE_ALLOWED_HOSTS must not use wildcard hosts in production")
 
 INSTALLED_APPS = [
     "django.contrib.contenttypes",
@@ -53,17 +59,22 @@ MEDIA_CONFIG = {
     "WEBHARD_PUBLIC_BASE_URL": os.environ.get("WEBHARD_PUBLIC_BASE_URL", "http://localhost:8083").rstrip("/"),
     "WEBHARD_INTERNAL_BASE_URL": os.environ.get("WEBHARD_INTERNAL_BASE_URL", os.environ.get("WEBHARD_PUBLIC_BASE_URL", "http://localhost:8083")).rstrip("/"),
     "MEDIA_INTERNAL_API_TOKEN": os.environ.get("MEDIA_INTERNAL_API_TOKEN", "" if IS_PRODUCTION else "dev-media-internal-token"),
-    "WEBHARD_STORAGE_ROOT": os.environ.get("WEBHARD_STORAGE_ROOT", str(BASE_DIR.parent.parent / "webhard-service" / "storage")),
+    "WEBHARD_STORAGE_ROOT": os.environ.get("WEBHARD_STORAGE_ROOT", str(BASE_DIR.parent / "webhard-service" / "storage")),
     "MEDIA_MONGO_URI": os.environ.get("MEDIA_MONGO_URI", "mongodb://localhost:27017"),
     "MEDIA_MONGO_DATABASE": os.environ.get("MEDIA_MONGO_DATABASE", "media_service"),
     "MEDIA_SYNC_LIMIT": int(os.environ.get("MEDIA_SYNC_LIMIT", "500")),
     "AUTH_CACHE_SECONDS": float(os.environ.get("MEDIA_AUTH_CACHE_SECONDS", "5")),
+    "SERVICE_STATUS_CACHE_SECONDS": float(os.environ.get("MEDIA_SERVICE_STATUS_CACHE_SECONDS", os.environ.get("MEDIA_AUTH_CACHE_SECONDS", "5"))),
+    "FILE_TOKEN_SECONDS": int(os.environ.get("MEDIA_FILE_TOKEN_SECONDS", "7200")),
     "YOUTUBE_YTDLP_PATH": os.environ.get("YOUTUBE_YTDLP_PATH", ""),
     "YOUTUBE_FFMPEG_PATH": os.environ.get("YOUTUBE_FFMPEG_PATH", ""),
+    "YOUTUBE_AUTO_INSTALL_FFMPEG": os.environ.get("YOUTUBE_AUTO_INSTALL_FFMPEG", "false" if IS_PRODUCTION else "true").lower() == "true",
     "YOUTUBE_TOOL_DIR": os.environ.get("YOUTUBE_TOOL_DIR", str(BASE_DIR / ".runtime" / "tools")),
     "YOUTUBE_IMPORT_LIMIT": int(os.environ.get("YOUTUBE_IMPORT_LIMIT", "100")),
     "YOUTUBE_IMPORT_MAX_ITEMS": int(os.environ.get("YOUTUBE_IMPORT_MAX_ITEMS", "100")),
 }
+if IS_PRODUCTION and MEDIA_CONFIG["MEDIA_INTERNAL_API_TOKEN"] == "dev-media-internal-token":
+    raise RuntimeError("MEDIA_INTERNAL_API_TOKEN must not use the development default in production")
 
 DEFAULT_CORS_ORIGINS = "http://localhost:8084,http://localhost:8085,http://127.0.0.1:8084,http://127.0.0.1:8085"
 CORS_ORIGINS = [

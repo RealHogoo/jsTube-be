@@ -16,6 +16,20 @@ class SecurityHeaderMiddleware:
 
         response["X-Content-Type-Options"] = "nosniff"
         response["X-Frame-Options"] = "DENY"
+        response["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; "
+            "connect-src 'self' https://fonts.gstatic.com; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; "
+            "media-src 'self' blob:; "
+            "font-src 'self' data: https://fonts.gstatic.com; "
+            "worker-src 'self' blob:; "
+            "object-src 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self'; "
+            "frame-ancestors 'none'"
+        )
         response["Referrer-Policy"] = "same-origin"
         response["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
 

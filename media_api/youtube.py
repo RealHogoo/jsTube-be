@@ -99,7 +99,7 @@ def import_youtube_item(
 
 def check_download_tools() -> dict[str, Any]:
     yt_dlp = check_yt_dlp()
-    ffmpeg = check_ffmpeg(auto_install=True)
+    ffmpeg = check_ffmpeg(auto_install=bool(settings.MEDIA_CONFIG.get("YOUTUBE_AUTO_INSTALL_FFMPEG")))
     webhard = check_webhard()
     required_ok = yt_dlp["installed"] and ffmpeg["installed"] and webhard["installed"]
     return {
@@ -489,7 +489,7 @@ def safe_file_name(title: str, video_id: str, suffix: str) -> str:
     if not base:
         base = video_id or "youtube-video"
     ext = suffix if suffix.startswith(".") else f".{suffix}"
-    return f"{base} [{video_id}]{ext}" if video_id else f"{base}{ext}"
+    return f"{base}{ext}"
 
 def safe_glob(value: str) -> str:
     return re.sub(r"([*?\[\]])", r"[\1]", value)
