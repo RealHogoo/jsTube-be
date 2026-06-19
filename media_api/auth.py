@@ -50,7 +50,7 @@ def require_user(request: HttpRequest, permission: str | None = None) -> Current
         return JsonResponse({"ok": False, "code": "UNAUTHORIZED", "message": "login is invalid"}, status=401)
     service_status = fetch_service_status(token, MEDIA_SERVICE)
     if service_status and str(service_status.get("use_yn") or "").upper() == "N":
-        return JsonResponse({"ok": False, "code": "FORBIDDEN", "message": "media service is disabled"}, status=403)
+        return JsonResponse({"ok": False, "code": "FORBIDDEN", "message": "튜브 서비스가 관리자에 의해 비활성화되었습니다."}, status=403)
     if not current_user.has_any_media_permission():
         return JsonResponse({"ok": False, "code": "FORBIDDEN", "message": "media permission is required"}, status=403)
     if permission and not current_user.has_permission(permission):
@@ -155,16 +155,19 @@ def fetch_current_user(token: str) -> CurrentUser | None:
 
 
 def fetch_service_status(token: str, service_code: str) -> dict[str, Any] | None:
-    cache_key = f"{token_cache_key(token)}:{normalize_code(service_code)}"
+    cache_key = normalize_code(service_code)
     cached = cached_service_status(cache_key)
     if cached is not _CACHE_MISS:
         return cached
-    url = f"{settings.MEDIA_CONFIG['ADMIN_SERVICE_BASE_URL']}/health/service/list.json"
+    internal_token = str(settings.MEDIA_CONFIG.get("ADMIN_INTERNAL_API_TOKEN") or settings.MEDIA_CONFIG.get("MEDIA_INTERNAL_API_TOKEN") or "").strip()
+    if not internal_token:
+        return None
+    url = f"{settings.MEDIA_CONFIG['ADMIN_SERVICE_BASE_URL']}/internal/service/use-status.json"
     try:
         response = requests.post(
             url,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={},
+            headers={"X-Internal-Api-Token": internal_token, "Content-Type": "application/json"},
+            json={"service_cd": normalize_code(service_code)},
             timeout=3,
         )
     except requests.RequestException:
@@ -172,14 +175,12 @@ def fetch_service_status(token: str, service_code: str) -> dict[str, Any] | None
     if not response.ok:
         return None
     body = response.json()
-    items = body.get("data")
-    if body.get("ok") is not True or not isinstance(items, list):
+    item = body.get("data")
+    if body.get("ok") is not True or not isinstance(item, dict):
         return None
-    normalized = normalize_code(service_code)
-    for item in items:
-        if isinstance(item, dict) and normalize_code(str(item.get("service_cd") or "")) == normalized:
-            cache_service_status(cache_key, item)
-            return item
+    if normalize_code(str(item.get("service_cd") or "")) == normalize_code(service_code):
+        cache_service_status(cache_key, item)
+        return item
     cache_service_status(cache_key, None)
     return None
 

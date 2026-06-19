@@ -472,7 +472,7 @@ def media_delete(request: HttpRequest, webhard_file_id: int) -> JsonResponse | H
     token = auth_token(request)
     try:
         response = requests.post(
-            f"{settings.MEDIA_CONFIG['WEBHARD_PUBLIC_BASE_URL']}/file/delete.json",
+            f"{settings.MEDIA_CONFIG['WEBHARD_INTERNAL_BASE_URL']}/file/delete.json",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json={"file_id": webhard_file_id},
             timeout=15,
@@ -528,7 +528,7 @@ def media_thumbnail(request: HttpRequest, webhard_file_id: int) -> JsonResponse 
     token = auth_token(request)
     try:
         response = requests.post(
-            f"{settings.MEDIA_CONFIG['WEBHARD_PUBLIC_BASE_URL']}/thumbnail/rebuild.json",
+            f"{settings.MEDIA_CONFIG['WEBHARD_INTERNAL_BASE_URL']}/thumbnail/rebuild.json",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json=payload,
             timeout=30,
@@ -687,6 +687,13 @@ def media_file_proxy(request: HttpRequest, webhard_file_id: int, file_kind: str)
     if not item:
         return JsonResponse({"ok": False, "code": "NOT_FOUND", "message": "media file not found"}, status=404)
 
+    if file_kind == "thumbnail":
+        etag = media_file_etag(item, file_kind)
+        if request.headers.get("If-None-Match") == etag:
+            response = HttpResponse(status=304)
+            apply_media_file_cache_headers(response, etag)
+            return response
+
     if signed_payload:
         local_response = local_media_file_response(item, file_kind, range_header)
         if local_response is not None:
@@ -724,6 +731,8 @@ def media_file_proxy(request: HttpRequest, webhard_file_id: int, file_kind: str)
         value = upstream.headers.get(header)
         if value:
             response[header] = value
+    if file_kind == "thumbnail":
+        apply_media_file_cache_headers(response, media_file_etag(item, file_kind))
     return response
 
 
@@ -1480,7 +1489,26 @@ def local_media_file_response(item: dict[str, Any], file_kind: str, range_header
         response["Content-Disposition"] = f'attachment; filename="{safe_download_name(str(item.get("file_name") or "download"))}"'
     else:
         response["Content-Security-Policy"] = "default-src 'none'; media-src 'self'; img-src 'self'; style-src 'none'; script-src 'none'; sandbox"
+    if file_kind == "thumbnail":
+        apply_media_file_cache_headers(response, media_file_etag(item, file_kind))
     return response
+
+
+def apply_media_file_cache_headers(response: HttpResponse, etag: str) -> None:
+    response["Cache-Control"] = "private, max-age=86400"
+    response["ETag"] = etag
+
+
+def media_file_etag(item: dict[str, Any], file_kind: str) -> str:
+    source = "|".join(
+        [
+            str(item.get("webhard_file_id") or ""),
+            file_kind,
+            str(item.get("thumbnail_path") if file_kind == "thumbnail" else item.get("storage_path") or ""),
+            str(item.get("updated_at") or item.get("synced_at") or ""),
+        ]
+    )
+    return '"' + hashlib.sha256(source.encode("utf-8")).hexdigest()[:24] + '"'
 
 
 def local_media_file_path(item: dict[str, Any], file_kind: str) -> Path | None:

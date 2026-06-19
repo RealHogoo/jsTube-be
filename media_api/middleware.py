@@ -18,7 +18,7 @@ class SecurityHeaderMiddleware:
         response["X-Frame-Options"] = "DENY"
         response["Content-Security-Policy"] = (
             "default-src 'self'; "
-            "script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; "
+            "script-src 'self'; "
             "connect-src 'self' https://fonts.gstatic.com; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: blob:; "

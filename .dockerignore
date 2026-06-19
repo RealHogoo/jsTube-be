@@ -1,0 +1,11 @@
+.git
+.runtime
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.sqlite3
+*.log
+codex-*.log
+jstube-be.*.log
+docs
