@@ -23,6 +23,7 @@ from pymongo.errors import PyMongoError
 
 from .auth import CurrentUser, auth_token, require_user
 from .mongo import karaoke_remote_collection, media_collection, media_user_state_collection, mongo_client
+from .search import normalize_search_text
 from .webhard import stream_webhard_file, sync_from_webhard, sync_one_from_webhard
 from .youtube import check_download_tools, import_youtube_item, preview_youtube
 
@@ -329,6 +330,7 @@ def media_list(request: HttpRequest) -> JsonResponse:
             "webhard_memo",
             "channel_name",
             "owner_user_id",
+            "search_text",
         ]
         search_query = {"$or": []}
         for field_name in search_fields:
@@ -336,6 +338,12 @@ def media_list(request: HttpRequest) -> JsonResponse:
                 {field_name: {"$regex": term_pattern, "$options": "i"}}
                 for term_pattern in search_patterns
             )
+        normalized_terms = [normalize_search_text(term) for term in search_terms]
+        search_query["$or"].extend(
+            {"search_text": {"$regex": re.escape(term), "$options": "i"}}
+            for term in normalized_terms
+            if term
+        )
         if "$or" in query:
             access_query = {"$or": query.pop("$or")}
             query["$and"] = [access_query, search_query]

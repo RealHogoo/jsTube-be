@@ -34,6 +34,7 @@ def media_collection():
     collection.create_index([("content_kind", ASCENDING), ("tags", ASCENDING), ("original_created_at", DESCENDING), ("webhard_file_id", DESCENDING)])
     collection.create_index([("content_kind", ASCENDING), ("tags", ASCENDING), ("view_count", DESCENDING), ("like_count", DESCENDING), ("original_created_at", DESCENDING)])
     collection.create_index([("content_kind", ASCENDING), ("tags", ASCENDING), ("like_count", DESCENDING), ("view_count", DESCENDING), ("original_created_at", DESCENDING)])
+    collection.create_index([("search_text", ASCENDING)])
     _media_collection = collection
     return _media_collection
 

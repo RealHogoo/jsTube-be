@@ -14,6 +14,7 @@ import requests
 from django.conf import settings
 from .auth import CurrentUser
 from .mongo import media_collection
+from .search import media_search_text
 from .webhard import check_webhard_internal_ready, register_youtube_file, sync_one_from_webhard
 
 def preview_youtube(url: str) -> dict[str, Any]:
@@ -434,6 +435,8 @@ def apply_youtube_metadata(file_id: int, item: dict[str, Any], playlist_id: str,
     video_id = str(item.get("youtube_video_id") or "")
     title = str(item.get("title") or video_id)
     media_tags = youtube_media_tags(title, tags)
+    description = item.get("description") or ""
+    channel_name = item.get("channel_name") or "YouTube"
     media_collection().update_one(
         {"webhard_file_id": file_id},
         {
@@ -446,10 +449,11 @@ def apply_youtube_metadata(file_id: int, item: dict[str, Any], playlist_id: str,
                 "youtube_playlist_title": playlist_title,
                 "title": title,
                 "display_name": title,
-                "description": item.get("description") or "",
-                "channel_name": item.get("channel_name") or "YouTube",
+                "description": description,
+                "channel_name": channel_name,
                 "album": playlist_title,
                 "tags": media_tags,
+                "search_text": media_search_text(title, video_id, description, channel_name, playlist_title, media_tags),
                 "synced_at": datetime.now(timezone.utc),
             }
         },

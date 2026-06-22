@@ -9,6 +9,7 @@ from django.conf import settings
 
 from .auth import CurrentUser
 from .mongo import media_collection, media_user_state_collection
+from .search import media_search_text
 
 _SESSION_STATE = local()
 
@@ -215,14 +216,18 @@ def media_document(row: dict[str, Any], synced_at: datetime, owner_is_admin: boo
     if not thumbnail_url and content_kind == "IMAGE":
         thumbnail_url = f"/api/media/{file_id}/content-file/"
     webhard_tags = normalize_webhard_tags(row.get("tags"))
+    file_name = row.get("file_name") or ""
+    display_name = row.get("display_name") or file_name
+    memo = str(row.get("memo") or "").strip()[:2000]
     return {
         "webhard_file_id": file_id,
         "owner_user_id": str(row["owner_user_id"]),
         "owner_is_admin": owner_is_admin,
-        "file_name": row.get("file_name") or "",
-        "display_name": row.get("display_name") or row.get("file_name") or "",
-        "webhard_memo": str(row.get("memo") or "").strip()[:2000],
+        "file_name": file_name,
+        "display_name": display_name,
+        "webhard_memo": memo,
         "webhard_tags": webhard_tags,
+        "search_text": media_search_text(file_name, display_name, memo, webhard_tags),
         "file_size": int(row.get("file_size") or 0),
         "content_type": row.get("content_type") or "application/octet-stream",
         "content_kind": content_kind,
